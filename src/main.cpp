@@ -1,137 +1,72 @@
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <AutoConnect.h>
 #include <Adafruit_NeoPixel.h>
-#include "led_control.h"
+#include <Arduino.h>
+#include <DNSServer.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266WiFi.h>
 
+#include "Config.h"
+#include "EEPROMHandler.h"
+#include "LEDHandler.h"
+#include "WebRoutes.h"
+#include "WiFiManager.h"
+
+// 🔧 Определение констант
 #define LED_PIN D2
 #define LED_COUNT 8
 
-ESP8266WebServer server;
-AutoConnect portal(server);
-AutoConnectConfig config;
-
+// 🌐 Глобальные объекты
+DNSServer dns;
+ESP8266WebServer server(80);
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-enum WState
-{
-  WIFI_DISCONNECTED,
-  WIFI_CONNECTING,
-  WIFI_CONNECTED,
-  WIFI_ERROR
-};
+// 🔄 Переменные состояния
+unsigned long timer1 = 0;
 
-WState currentState = WIFI_DISCONNECTED;
-unsigned long lastBlink = 0;
-bool ledOn = false;
+bool ready = false;
 
-// 📡 Страница состояния сети
-void handleStatusPage()
-{
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Состояние сети</title></head><body>";
-  html += "<h2>Состояние подключения</h2>";
+void setup() {
+  Serial.begin(9600);
+  delay(1000);  // Даем время Serial для инициализации
+  Serial.println("\n🚀 Запуск системы...");
 
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    html += "<p><strong>SSID:</strong> " + WiFi.SSID() + "</p>";
-    html += "<p><strong>IP:</strong> " + WiFi.localIP().toString() + "</p>";
-    html += "<p><strong>RSSI:</strong> " + String(WiFi.RSSI()) + " dBm</p>";
-    html += "<p><a href='/led'>Перейти к управлению</a></p>";
-  }
-  else
-  {
-    html += "<p>❌ Не подключено к сети Wi-Fi</p>";
-    html += "<p><a href='/_ac'>Настроить подключение</a></p>";
-  }
+  // 💾 Инициализация EEPROM
+  EEPROMHandler::begin();
 
-  html += "</body></html>";
-  server.send(200, "text/html", html);
+  // 💾 Загрузка конфигурации из EEPROM
+  loadAppConfig();
+
+  // Увеличиваем счетчик перезагрузок и сохраняем
+  config.bootCount++;
+  saveAppConfig();
+
+  // 💡 Инициализация светодиодной ленты
+  LEDHandler::initStrip(&strip);
+
+  // 🎨 Восстановление последнего цвета
+  LEDHandler::setColor(&strip, String(config.lastColor));
+
+  // 🌐 Инициализация Wi-Fi с настройками из EEPROM
+  WiFiManager::initWiFi(&dns, &server);
+
+  // 🌐 Регистрация обработчиков веб-сервера
+  WebRoutes::registerRoutes(&server, &strip);
+
+  // 🚀 Запуск веб-сервера
+  server.begin();
+  Serial.println("🌐 Веб-сервер запущен!");
 }
 
-void setup()
-{
-  Serial.begin(115200);
-  strip.begin();
-  strip.show(); // очистка
-
-  // ⚙️ Настройки AutoConnect
-  config.apid = "ESP_Config";
-  config.psk = "11111111";
-  config.autoRise = true;
-  config.immediateStart = true;
-  config.retainPortal = true;
-  config.homeUri = "/led"; // ✅ автоматический переход на /led после подключения
-
-  portal.config(config);
-
-  // 🌐 Роуты
-  server.on("/led", handleLedPage);
-  server.on("/setColor", handleSetColor);
-  server.on("/status", handleStatusPage);
-
-  // 🚀 Запуск портала
-  currentState = WIFI_CONNECTING;
-  if (portal.begin())
-  {
-    currentState = WIFI_CONNECTED;
-    Serial.println("✅ Подключено! IP: " + WiFi.localIP().toString());
-  }
-  else
-  {
-    currentState = WIFI_DISCONNECTED;
-    Serial.println("🕸 Captive Portal активен. Ожидание подключения...");
-  }
-}
-
-void updateStatusLED()
-{
+void loop() {
   unsigned long now = millis();
 
-  switch (currentState)
-  {
-  case WIFI_DISCONNECTED:
-    if (now - lastBlink > 500)
-    {
-      ledOn = !ledOn;
-      uint32_t color = ledOn ? strip.Color(255, 0, 0) : strip.Color(0, 0, 0);
-      for (int i = 0; i < strip.numPixels(); i++)
-        strip.setPixelColor(i, color);
-      strip.show();
-      lastBlink = now;
-    }
-    break;
+  dns.processNextRequest();
+  server.handleClient();
 
-  case WIFI_CONNECTING:
-    static uint8_t brightness = 0;
-    static int8_t direction = 5;
-    brightness += direction;
-    if (brightness >= 255 || brightness <= 0)
-      direction = -direction;
-    for (int i = 0; i < strip.numPixels(); i++)
-      strip.setPixelColor(i, strip.Color(0, 255, 0));
-    strip.show();
-    delay(20);
-    break;
-
-  case WIFI_ERROR:
-    if (now - lastBlink > 200)
-    {
-      ledOn = !ledOn;
-      uint32_t color = ledOn ? strip.Color(255, 0, 0) : strip.Color(0, 0, 0);
-      for (int i = 0; i < strip.numPixels(); i++)
-        strip.setPixelColor(i, color);
-      strip.show();
-      lastBlink = now;
-    }
-    break;
+  // 🔄 Обновление индикации каждые 500 мс
+  if (now - timer1 > 500 && !ready) {
+    LEDHandler::updateStatusLED(&strip, &timer1);
   }
-}
 
-void loop()
-{
-  portal.handleClient();
-  if (currentState != WIFI_CONNECTED)
-  {
-    updateStatusLED(); // 🔄 обновляем индикацию
-  }
+  // 🔍 Периодическая проверка состояния Wi-Fi
+  WiFiManager::checkWiFiStatus(now);
 }
